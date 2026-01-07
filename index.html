@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>ChawinTracking</title>
+
+  <!-- ================= FIREBASE SDKs ================= -->
+  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js"></script>
+
+  <!-- ================= EXPORT LIBRARIES ================= -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+
+  <style>
+    table {
+      border-collapse: collapse;
+      margin-top: 10px;
+    }
+    th, td {
+      padding: 6px 10px;
+      text-align: center;
+    }
+    input, select, button {
+      margin-right: 6px;
+    }
+    .table-wrapper {
+      display: flex;
+      align-items: flex-start;
+      gap: 20px;
+      margin-top: 15px;
+    }
+    .reminder-box {
+      max-width: 280px;
+      font-size: 14px;
+      color: red;
+      line-height: 1.4;
+    }
+  </style>
+</head>
+
+<body>
+
+<h1>ChawinTracking App</h1>
+
+<!-- ================= INPUTS ================= -->
+<label>Entry type:</label>
+<select id="entryType">
+  <option value="work">Working hours</option>
+  <option value="sick">Sick Leave</option>
+  <option value="vacation">Vacation Day</option>
+</select>
+
+<label>Working hours:</label>
+<input id="hoursInput" type="text" placeholder="e.g. 8.5 or 8:30">
+
+<label>Working day (Dayforce):</label>
+<input id="workDayInput" type="date">
+
+<br><br>
+
+<!-- ================= BUTTONS ================= -->
+<button type="button" id="saveButton">Process</button>
+<button type="button" id="deleteButton">Delete Entry</button>
+
+<button type="button" id="exportCsvButton">Export CSV</button>
+<button type="button" id="exportExcelButton">Export Excel</button>
+<button type="button" id="exportPdfButton">Export PDF</button>
+
+<button type="button" id="clearButton">Clear Storage</button>
+
+<div class="table-wrapper">
+
+<table border="1" id="dataTable">
+  <thead>
+    <tr>
+      <th>#</th>
+      <th>Type</th>
+      <th>Hours</th>
+      <th>Working Day</th>
+      <th>Accumulated</th>
+      <th>Overhours</th>
+      <th>Hrs/Day</th>
+    </tr>
+  </thead>
+  <tbody></tbody>
+</table>
+
+<p class="reminder-box">
+  <strong>Decimal → Time:</strong><br><br>
+  8.08 → 8:05<br>
+  8.17 → 8:10<br>
+  8.25 → 8:15<br>
+  8.50 → 8:30<br>
+  7.60 → 7:36<br>
+  7.83 → 7:50<br>
+  8.67 → 8:40<br>
+  8.75 → 8:45
+</p>
+
+</div>
+
+<script>
+/* =================================================
+   FIREBASE CONFIG — CHAWIN TRACKING
+   ================================================= */
+firebase.initializeApp({
+  apiKey: "PASTE_CHAWIN_API_KEY",
+  authDomain: "chawin-tracking.firebaseapp.com",
+  databaseURL: "https://chawin-tracking-default-rtdb.europe-west1.firebasedatabase.app",
+  projectId: "chawin-tracking",
+  storageBucket: "chawin-tracking.appspot.com",
+  messagingSenderId: "XXXXXX",
+  appId: "XXXXXX"
+});
+
+const db = firebase.database();
+
+/* 🔒 Isolated path for Chawin */
+const entriesRef = db.ref("chawin/entries");
+
+/* =================================================
+   CONFIG
+   ================================================= */
+const DEFAULT_DAY_HOURS = 7.6;
+const WEEK_LIMIT = 38;
+
+/* =================================================
+   DOM
+   ================================================= */
+const entryType = document.getElementById("entryType");
+const hoursInput = document.getElementById("hoursInput");
+const workDayInput = document.getElementById("workDayInput");
+const dataTableBody = document.querySelector("#dataTable tbody");
+
+const saveButton = document.getElementById("saveButton");
+const deleteButton = document.getElementById("deleteButton");
+const clearButton = document.getElementById("clearButton");
+const exportCsvButton = document.getElementById("exportCsvButton");
+const exportExcelButton = document.getElementById("exportExcelButton");
+const exportPdfButton = document.getElementById("exportPdfButton");
+
+/* =================================================
+   TIME HELPERS
+   ================================================= */
+function decimalToTime(decimal) {
+  const h = Math.floor(decimal);
+  const m = Math.round((decimal - h) * 60);
+  return `${h}:${m.toString().padStart(2, "0")}`;
+}
+
+function parseTimeInput(value) {
+  value = value.trim();
+  if (value.includes(":")) {
+    const [h, m] = value.split(":").map(Number);
+    if (isNaN(h) || isNaN(m) || m >= 60) return NaN;
+    return h + m / 60;
+  }
+  const num = Number(value.replace(",", "."));
+  return isNaN(num) ? NaN : num;
+}
+
+/* =================================================
+   ENTRY TYPE
+   ================================================= */
+entryType.onchange = () => {
+  if (entryType.value === "work") {
+    hoursInput.disabled = false;
+    hoursInput.value = "";
+  } else {
+    hoursInput.disabled = true;
+    hoursInput.value = DEFAULT_DAY_HOURS;
+  }
+};
+
+/* =================================================
+   LOAD + RENDER
+   ================================================= */
+function loadEntries(cb) {
+  entriesRef.once("value", snap => {
+    dataTableBody.innerHTML = "";
+    let rows = [];
+    let total = 0;
+    let over = 0;
+    let i = 1;
+
+    snap.forEach(c => {
+      const e = c.val();
+      total += e.value;
+
+      if (total > WEEK_LIMIT) {
+        over += total - WEEK_LIMIT;
+        total = WEEK_LIMIT;
+      }
+
+      const row = [
+        i++,
+        e.typeLabel,
+        decimalToTime(e.value),
+        e.workDay,
+        decimalToTime(total),
+        decimalToTime(over),
+        Math.floor(over / 8) || ""
+      ];
+
+      rows.push(row);
+      const tr = document.createElement("tr");
+      tr.innerHTML = row.map(v => `<td>${v}</td>`).join("");
+      dataTableBody.appendChild(tr);
+    });
+
+    if (cb) cb(rows);
+  });
+}
+
+loadEntries();
+
+/* =================================================
+   SAVE
+   ================================================= */
+saveButton.onclick = () => {
+  if (!workDayInput.value) return alert("Select working day");
+
+  let hours, label;
+  if (entryType.value === "work") {
+    hours = parseTimeInput(hoursInput.value);
+    if (isNaN(hours)) return alert("Invalid time");
+    label = "Work";
+  } else {
+    hours = DEFAULT_DAY_HOURS;
+    label = entryType.value === "sick" ? "Sick Leave" : "Vacation";
+  }
+
+  entriesRef.push({ value: hours, workDay: workDayInput.value, typeLabel: label });
+  hoursInput.value = "";
+  workDayInput.value = "";
+  loadEntries();
+};
+
+/* =================================================
+   DELETE
+   ================================================= */
+deleteButton.onclick = () => {
+  const id = Number(prompt("Entry number to delete:"));
+  entriesRef.once("value", snap => {
+    const keys = Object.keys(snap.val() || {});
+    if (!keys[id - 1]) return alert("Invalid ID");
+    entriesRef.child(keys[id - 1]).remove();
+    loadEntries();
+  });
+};
+
+/* =================================================
+   CLEAR
+   ================================================= */
+clearButton.onclick = () => {
+  if (confirm("Clear all data?")) entriesRef.remove(), loadEntries();
+};
+
+/* =================================================
+   EXPORTS
+   ================================================= */
+exportCsvButton.onclick = () =>
+  loadEntries(r => {
+    const csv = [["#", "Type", "Hours", "Day", "Accum.", "Over", "Days"], ...r]
+      .map(x => x.map(v => `"${v}"`).join(",")).join("\n");
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([csv]));
+    a.download = "chawin_tracking.csv";
+    a.click();
+  });
+
+exportExcelButton.onclick = () =>
+  loadEntries(r => {
+    const ws = XLSX.utils.aoa_to_sheet([["#", "Type", "Hours", "Day", "Accum.", "Over", "Days"], ...r]);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Tracking");
+    XLSX.writeFile(wb, "chawin_tracking.xlsx");
+  });
+
+exportPdfButton.onclick = () =>
+  loadEntries(r => {
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF();
+    doc.text("Chawin Working Hours", 14, 15);
+    let y = 25;
+    r.forEach(x => doc.text(x.join(" | "), 14, y += 5));
+    doc.save("chawin_tracking.pdf");
+  });
+</script>
+
+</body>
+</html>
